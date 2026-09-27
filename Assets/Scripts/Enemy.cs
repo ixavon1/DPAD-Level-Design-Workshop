@@ -28,10 +28,19 @@ public class Enemy : MonoBehaviour
     {
         if (!dead)
         {
-            if (Physics2D.OverlapCircleAll(leftWallCheck.position, 0.1f, ground).Length > 1) { dir = 1; sr.flipX = true; }
-            else if (Physics2D.OverlapCircleAll(rightWallCheck.position, 0.1f, ground).Length > 1) { dir = -1; sr.flipX = false; }
-            if (Physics2D.OverlapCircleAll(leftFootCheck.position, 0.1f, ground).Length <= 1) { dir = 1; sr.flipX = true; }
-            else if (Physics2D.OverlapCircleAll(rightFootCheck.position, 0.1f, ground).Length <= 1) { dir = -1; sr.flipX = false; }
+            // The serialized mask also contains the Enemy layer for enemy stacking.
+            // Exclude this enemy's layer here so its probes cannot hit its own body.
+            int terrainMask = ground.value & ~(1 << gameObject.layer);
+            bool wallOnLeft = Physics2D.Raycast(leftWallCheck.position, Vector2.left, 0.2f, terrainMask);
+            bool wallOnRight = Physics2D.Raycast(rightWallCheck.position, Vector2.right, 0.2f, terrainMask);
+            bool groundOnLeft = Physics2D.Raycast(leftFootCheck.position, Vector2.down, 0.2f, terrainMask);
+            bool groundOnRight = Physics2D.Raycast(rightFootCheck.position, Vector2.down, 0.2f, terrainMask);
+
+            // Turn only when the sensor in the current travel direction finds a wall
+            // or reaches a real ledge. Requiring the trailing foot to remain supported
+            // prevents both sensors from fighting while the enemy is airborne.
+            if (dir < 0 && (wallOnLeft || (!groundOnLeft && groundOnRight))) SetDirection(1);
+            else if (dir > 0 && (wallOnRight || (!groundOnRight && groundOnLeft))) SetDirection(-1);
 
             // Allows enemy to ride other enemies
             if (Physics2D.OverlapCircle(enemyProbe.position, 0.1f, enemy)) { riding = Physics2D.OverlapCircle(enemyProbe.position, 0.1f, enemy).GetComponent<Enemy>(); }
@@ -44,6 +53,12 @@ public class Enemy : MonoBehaviour
         }
 
         rb.linearVelocity = new(speed * dir, rb.linearVelocity.y);
+    }
+
+    private void SetDirection(int newDirection)
+    {
+        dir = newDirection;
+        sr.flipX = dir > 0;
     }
 
     public void Die()

@@ -1,8 +1,5 @@
 using System.Collections;
 using System.Collections.Generic;
-using System.IO;
-using System.Security.Cryptography;
-using UnityEditor;
 using UnityEngine;
 
 [System.Serializable]
@@ -19,13 +16,26 @@ public class LevelCreator : MonoBehaviour
     public LevelComponent[] components;
     public int maxObjects;
     public Transform player;
+    private CompositeCollider2D groundComposite;
 
     private void Awake()
     {
+        ConfigureCompositeGround();
         CreateLevel();
+    }
 
-        if (ComputeHash("Assets/level.png") != PlayerPrefs.GetString("PrevHash")) { PlayerPrefs.SetFloat("CheckpointX", 0); PlayerPrefs.SetFloat("CheckpointY", 0); }
-        PlayerPrefs.SetString("PrevHash", ComputeHash("Assets/level.png"));
+    private void ConfigureCompositeGround()
+    {
+        int groundLayer = LayerMask.NameToLayer("Ground");
+        if (groundLayer >= 0) gameObject.layer = groundLayer;
+
+        Rigidbody2D groundBody = GetComponent<Rigidbody2D>();
+        if (groundBody == null) groundBody = gameObject.AddComponent<Rigidbody2D>();
+        groundBody.bodyType = RigidbodyType2D.Static;
+
+        groundComposite = GetComponent<CompositeCollider2D>();
+        if (groundComposite == null) groundComposite = gameObject.AddComponent<CompositeCollider2D>();
+        groundComposite.geometryType = CompositeCollider2D.GeometryType.Polygons;
     }
 
     public void CreateLevel()
@@ -43,9 +53,32 @@ public class LevelCreator : MonoBehaviour
                 if (maxObjects < 0) { Debug.LogError("Ran out of objects. Please increase max objects in Level Creator object!"); return; }
                 if (closestObject == null) { player.position = new Vector2(disPerPixel * x, disPerPixel * y); continue; }
                 GameObject g = Instantiate(closestObject, new Vector2(disPerPixel * x, disPerPixel * y), Quaternion.identity, transform);
-                if (g.layer == 6 && !g.CompareTag("Spike")) ProbeGround(g.transform, x, y);
+                if (g.layer == 6 && !g.CompareTag("Spike"))
+                {
+                    ConfigureGroundCollider(g);
+                    ProbeGround(g.transform, x, y);
+                }
             }
         }
+    }
+
+    // A solid box is much more reliable than four independent edges. Adjacent edge
+    // colliders leave seams that can catch a moving body or let it tunnel between tiles.
+    private void ConfigureGroundCollider(GameObject groundObject)
+    {
+        EdgeCollider2D[] edges = groundObject.GetComponents<EdgeCollider2D>();
+        if (edges.Length == 0) return;
+
+        PhysicsMaterial2D material = edges[0].sharedMaterial;
+        foreach (EdgeCollider2D edge in edges) edge.enabled = false;
+
+        BoxCollider2D solidCollider = groundObject.AddComponent<BoxCollider2D>();
+        Vector3 scale = groundObject.transform.lossyScale;
+        solidCollider.size = new Vector2(
+            disPerPixel / Mathf.Max(Mathf.Abs(scale.x), 0.0001f),
+            disPerPixel / Mathf.Max(Mathf.Abs(scale.y), 0.0001f));
+        solidCollider.sharedMaterial = material;
+        solidCollider.compositeOperation = Collider2D.CompositeOperation.Merge;
     }
 
     private LevelComponent GetClosestComponent(int x, int y)
@@ -81,15 +114,4 @@ public class LevelCreator : MonoBehaviour
         if (GetClosestComponent(x - 1, y)?.color != Color.black) { ground.GetChild(3).gameObject.SetActive(true); }
     }
 
-    private string ComputeHash(string filePath)
-    {
-        using (var md5 = MD5.Create())
-        {
-            using (var stream = File.OpenRead(filePath))
-            {
-                var hash = md5.ComputeHash(stream);
-                return System.BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
-            }
-        }
-    }
 }

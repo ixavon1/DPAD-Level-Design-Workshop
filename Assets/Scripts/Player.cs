@@ -3,8 +3,18 @@ using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
+public enum WallJumpMode
+{
+    Disabled,
+    Regular,
+    Climbing
+}
+
 public class Player : MonoBehaviour
 {
+    private static bool hasRunCheckpoint;
+    private static Vector2 runCheckpoint;
+
     Rigidbody2D rb;
     Animator anim;
     SpriteRenderer sr;
@@ -26,14 +36,22 @@ public class Player : MonoBehaviour
     private float earlyInputBuffer, coyoteBuffer;
 
     [Header("Wall Jumping")]
+    [Tooltip("Disabled: no wall actions. Regular: jump away from walls. Climbing: repeatedly jump up the same wall.")]
+    public WallJumpMode wallJumpMode = WallJumpMode.Regular;
     public float wallJumpHorizontalForce;
+    [Min(0)] public float climbingWallJumpHorizontalForce = 2.5f;
     public float wallJumpVerticalForce;
     public float slideGravity;
     private bool sliding, touchingLeftWall, touchingRightWall;
     public float minDisFromGroundForJump;
     private float disFromGround;
-    private float slideDir;
-    private float slideExitBuffer;
+    [Min(0)] public float wallSlideSpeed = 3f;
+    [Min(0)] public float wallCoyoteTime = 0.12f;
+    [Min(0)] public float wallJumpControlLock = 0.15f;
+    private int wallSide;
+    private float wallCoyoteBuffer;
+    private float horizontalControlLock;
+    private float groundCheckDisableTimer;
 
     [Header("Misc (do not touch)")]
     public LayerMask ground;
@@ -45,6 +63,13 @@ public class Player : MonoBehaviour
     private bool dead;
     public GameObject deathObject;
 
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+    private static void ResetRunCheckpoint()
+    {
+        hasRunCheckpoint = false;
+        runCheckpoint = Vector2.zero;
+    }
+
     private void Start()
     {
         rb = GetComponent<Rigidbody2D>();
@@ -52,11 +77,12 @@ public class Player : MonoBehaviour
         sr = GetComponent<SpriteRenderer>();
 
         rb.gravityScale = gravity;
+        rb.collisionDetectionMode = CollisionDetectionMode2D.Continuous;
+        rb.interpolation = RigidbodyInterpolation2D.Interpolate;
 
         currentSprintMod = 1;
 
-        Vector2 checkpoint = new(PlayerPrefs.GetFloat("CheckpointX"), PlayerPrefs.GetFloat("CheckpointY"));
-        if (checkpoint != Vector2.zero) { transform.position = checkpoint; }
+        if (hasRunCheckpoint) transform.position = runCheckpoint;
 
         transform.GetChild(0).parent = null;
     }
@@ -76,28 +102,39 @@ public class Player : MonoBehaviour
         if (Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift)) { currentSprintMod = sprintMod; }
         else { currentSprintMod = 1; }
 
-        // Wall jump input
-        if (jumpInput && (sliding || slideExitBuffer > 0))
+        bool wallJumped = false;
+
+        // Wall jumps work from direct contact or shortly after leaving a wall. The
+        // launch always goes away from the wall, regardless of the held direction.
+        if (wallJumpMode != WallJumpMode.Disabled && jumpInput && !grounded && wallCoyoteBuffer > 0 && wallSide != 0)
         {
-            rb.linearVelocity = new(wallJumpHorizontalForce * -slideDir, wallJumpVerticalForce);
+            bool climbingJump = wallJumpMode == WallJumpMode.Climbing;
+            float horizontalForce = -wallSide * (climbingJump ? climbingWallJumpHorizontalForce : wallJumpHorizontalForce);
+            rb.linearVelocity = new Vector2(horizontalForce, wallJumpVerticalForce);
             sliding = false;
-            sr.flipX = !sr.flipX;
+            wallJumped = true;
+            wallCoyoteBuffer = 0;
+            earlyInputBuffer = 0;
+            horizontalControlLock = climbingJump ? 0 : wallJumpControlLock;
+            groundCheckDisableTimer = 0.08f;
+            sr.flipX = climbingJump ? wallSide < 0 : wallSide > 0;
         }
 
         // Jump input
-        if ((grounded || currentJumps < maxJumps - 1 || coyoteBuffer > 0) && (jumpInput || earlyInputBuffer > 0) && !sliding)
+        if (!wallJumped && (grounded || currentJumps < maxJumps - 1 || coyoteBuffer > 0) && (jumpInput || earlyInputBuffer > 0))
         {
+            bool usedCoyoteTime = !grounded && coyoteBuffer > 0;
             coyoteBuffer = 0;
             earlyInputBuffer = 0;
 
-            if (!grounded && coyoteBuffer <= 0) { currentJumps++; }
+            if (!grounded && !usedCoyoteTime) { currentJumps++; }
             rb.linearVelocity = new(rb.linearVelocity.x, jumpForce);
-            transform.Translate(new(0, 0.3f, 0));
             grounded = false;
+            groundCheckDisableTimer = 0.08f;
         }
 
         // Handles early input; if the user tries to jump just before hitting the ground, this "stores" the input and lets them jump anyway
-        if (jumpInput && !grounded && currentJumps >= maxJumps - 1 && coyoteBuffer <= 0 && useInputBuffers && !sliding)
+        if (jumpInput && !wallJumped && !grounded && currentJumps >= maxJumps - 1 && coyoteBuffer <= 0 && useInputBuffers)
         {
             earlyInputBuffer = 0.12f;
         }
@@ -113,17 +150,25 @@ public class Player : MonoBehaviour
         // Decreases timers
         if (earlyInputBuffer > 0) earlyInputBuffer-= Time.fixedDeltaTime;
         if (coyoteBuffer > 0) coyoteBuffer -= Time.fixedDeltaTime;
-        if (slideExitBuffer > 0) slideExitBuffer -= Time.fixedDeltaTime;
+        if (wallCoyoteBuffer > 0) wallCoyoteBuffer -= Time.fixedDeltaTime;
+        if (horizontalControlLock > 0) horizontalControlLock -= Time.fixedDeltaTime;
+        if (groundCheckDisableTimer > 0) groundCheckDisableTimer -= Time.fixedDeltaTime;
 
         // Handles horizontal input by directly modifying rb.velocity, moving the x velocity towards the target speed
-        float goal = inputX * speed * currentSprintMod;
-        rb.linearVelocity = new(Mathf.MoveTowards(rb.linearVelocity.x, goal, acceleration * Time.fixedDeltaTime), rb.linearVelocity.y);
+        if (horizontalControlLock <= 0)
+        {
+            float goal = inputX * speed * currentSprintMod;
+            rb.linearVelocity = new(Mathf.MoveTowards(rb.linearVelocity.x, goal, acceleration * Time.fixedDeltaTime), rb.linearVelocity.y);
+        }
 
         // Checks if the player is currently touching the ground using an OverlapCircle
-        grounded = Physics2D.OverlapCircle(foot1.position, 0.1f, ground) || Physics2D.OverlapCircle(foot2.position, 0.1f, ground);
-        if (grounded) 
+        grounded = groundCheckDisableTimer <= 0 &&
+            (Physics2D.OverlapCircle(foot1.position, 0.1f, ground) || Physics2D.OverlapCircle(foot2.position, 0.1f, ground));
+        if (grounded)
         {
-            currentJumps = 0; 
+            currentJumps = 0;
+            wallCoyoteBuffer = 0;
+            wallSide = 0;
             if (useInputBuffers) coyoteBuffer = 0.12f;
         }
 
@@ -136,12 +181,29 @@ public class Player : MonoBehaviour
         touchingLeftWall = Physics2D.OverlapCircle(leftWallCheck.position, 0.1f, ground);
         touchingRightWall = Physics2D.OverlapCircle(rightWallCheck.position, 0.1f, ground);
 
-        // Decides if the player should be sliding or not
-        if (((inputX < 0  && touchingLeftWall) || (inputX > 0 && touchingRightWall) || (inputX == 0 && sliding)) && rb.linearVelocity.y < 0 && !grounded && (sliding || disFromGround > minDisFromGroundForJump) && (touchingLeftWall || touchingRightWall)) { if (!sliding) StartSliding(); }
-        else sliding = false;
-        if (Mathf.RoundToInt(slideDir) == Mathf.RoundToInt(-inputX)) sliding = false;
-        // Changes rb gravity based on sliding
-        if (sliding) { rb.gravityScale = slideGravity; if (useInputBuffers) { slideExitBuffer = 0.12f; } }
+        if (wallJumpMode != WallJumpMode.Disabled && !grounded && (touchingLeftWall || touchingRightWall))
+        {
+            // If both checks overlap (for example in a narrow gap), favor the side
+            // the player is moving toward so the jump direction stays predictable.
+            if (touchingLeftWall && touchingRightWall) wallSide = inputX < 0 ? -1 : 1;
+            else wallSide = touchingLeftWall ? -1 : 1;
+            wallCoyoteBuffer = wallCoyoteTime;
+        }
+        else if (wallJumpMode == WallJumpMode.Disabled)
+        {
+            wallCoyoteBuffer = 0;
+            wallSide = 0;
+        }
+
+        // Sliding is automatic while falling against a wall. It no longer gates the
+        // ability to wall jump, and the capped fall speed gives consistent feedback.
+        sliding = wallJumpMode != WallJumpMode.Disabled && !grounded && rb.linearVelocity.y < 0 && disFromGround > 0.1f &&
+            (touchingLeftWall || touchingRightWall);
+        if (sliding)
+        {
+            rb.gravityScale = slideGravity;
+            rb.linearVelocity = new Vector2(rb.linearVelocity.x, Mathf.Max(rb.linearVelocity.y, -wallSlideSpeed));
+        }
         else rb.gravityScale = modGravity;
 
         if (dead)
@@ -155,13 +217,6 @@ public class Player : MonoBehaviour
         anim.SetBool("Grounded", grounded);
         anim.SetFloat("Speed", currentSprintMod);
         anim.SetBool("Sliding", sliding);
-    }
-
-    private void StartSliding()
-    {
-        sliding = true;
-        rb.linearVelocity = Vector2.zero;
-        slideDir = inputX;
     }
 
     private void OnTriggerEnter2D(Collider2D collision)
@@ -189,8 +244,8 @@ public class Player : MonoBehaviour
             if (lastCheckpoint) { lastCheckpoint.GetComponent<SpriteRenderer>().sprite = flagUnraised; }
             collision.GetComponent<SpriteRenderer>().sprite = flagRaised;
             lastCheckpoint = collision.transform;
-            PlayerPrefs.SetFloat("CheckpointX", lastCheckpoint.position.x);
-            PlayerPrefs.SetFloat("CheckpointY", lastCheckpoint.position.y);
+            runCheckpoint = lastCheckpoint.position;
+            hasRunCheckpoint = true;
         }
 
         // Handles hitting spikes/enemies
@@ -209,4 +264,6 @@ public class Player : MonoBehaviour
     }
 
     private void ResetScene() { SceneManager.LoadScene(SceneManager.GetActiveScene().name); }
+
+    private void OnApplicationQuit() { ResetRunCheckpoint(); }
 }
